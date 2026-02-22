@@ -1,0 +1,233 @@
+---
+name: Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ${{ github.ref }}
+        description: Git ref to checkout
+      debug:
+        type: boolean
+        required: false
+        default: false
+        description: |
+          Enable upterm debugging
+      components:
+        type: string
+        required: true
+        description: >-
+          The list of components to build images for, formatted as a space-separated list of strings.
+      version:
+        type: string
+        required: true
+        description: >-
+          The version string used when building images. Should come from build-images workflow output.
+      release-tag:
+        type: string
+        required: false
+        default: ${{ github.ref_name }}
+        description: >-
+          The tag to use for the release. Defaults to the current ref name.
+      chart-registry:
+        type: string
+        required: false
+        default: ghcr.io/emissary-ingress
+        description: |
+          OCI repository to push charts to
+
+          Defaults to: ghcr.io/emissary-ingress
+      image-registry:
+        type: string
+        required: false
+        default: ghcr.io/emissary-ingress
+        description: |
+          OCI repository to push images to
+
+          Defaults to: ghcr.io/emissary-ingress
+
+    outputs:
+      pushed-charts:
+        value: ${{ jobs.release.outputs.pushed-charts }}
+        description: >-
+          TODO
+      pushed-images:
+        value: ${{ jobs.release.outputs.pushed-images }}
+        description: >-
+          TODO
+
+permissions:
+  contents: write  # Required for creating GitHub releases
+  packages: write  # Required for pushing to GHCR
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      pushed-charts: ${{ steps.push-artifacts.outputs.pushed-charts }}
+      pushed-images: ${{ steps.push-artifacts.outputs.pushed-images }}
+
+    steps:
+      - id: setup-docker-buildx
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - id: configure-ghcr-auth
+        name: Configure Docker GHCR Auth
+        if: ${{ steps.setup-docker-buildx.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: configure-helm-auth
+        name: Configure Helm GHCR Auth
+        if: ${{ steps.configure-ghcr-auth.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        shell: bash
+        run: |
+          echo "${{ github.token }}" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
+
+      - id: download-artifacts
+        name: Download CI Artifacts
+        if: ${{ steps.configure-ghcr-auth.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        uses: actions/download-artifact@v6
+        with:
+          merge-multiple: true
+          path: ${{ github.workspace }}/artifacts
+
+      - id: push-artifacts
+        name: Push Release Artifacts
+        if: ${{ steps.download-artifacts.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        shell: bash
+        env:
+          # possible values for `runner.arch`: ["X86", "X64", "ARM", "ARM64"]
+          # see https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#example
+          # for GitHub's explanation of using conditional logic in expressions
+          ARCHES: ${{ (env.ACT == 'true' && (runner.arch == 'X86' && 'AMD64' || runner.arch )) || 'AMD64 ARM64' }}
+        run: |
+          set -euo pipefail
+
+          trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+          # NOTE: intended meaning of exit codes match their HTTP status equivilent (e.g., exit code 404 == '(file) not found')
+
+          VERSION="${{ inputs.version }}"
+          PUSHED_CHARTS=()
+          PUSHED_IMAGES=()
+          ARCHES=($(echo ${ARCHES} | tr '[[:upper:]]' '[[:lower:]]'))
+
+          echo -e "pushing images for:\n\tversion: ${VERSION}\n\tarches: ${ARCHES[@]}\n\tcomponents: ${{ inputs.components }}"
+
+          for COMPONENT in ${{ inputs.components }}; do
+              COMPONENT_IMAGES=()
+
+              for ARCH in ${ARCHES[@]}; do
+                  IMAGE_PATH="${{ github.workspace }}/artifacts/${COMPONENT}-${ARCH}-image.tar"
+
+                  if [[ ! -f "${IMAGE_PATH}" ]]; then
+                      echo "Tarball for ${COMPONENT}/${ARCH} not found at expected path: ${IMAGE_PATH}" 1>&2
+                      exit 404  # (file) not found
+                  fi
+
+                  LOADED_IMAGE="$(docker load --input "${IMAGE_PATH}" | cut -d' ' -f3)" \
+                  || { EXIT_CODE=$?; echo "failed to load image from tarball: ${IMAGE_PATH}" 1>&2; exit ${EXIT_CODE}; }
+
+                  # Tag with the version from build-images workflow
+                  COMPONENT_ARCH_TAG="${{ inputs.image-registry }}/${COMPONENT}:${VERSION}-${ARCH}"
+
+                  echo "loaded image: ${LOADED_IMAGE}"
+                  echo "tagging as: ${COMPONENT_ARCH_TAG}"
+
+                  docker tag "${LOADED_IMAGE}" "${COMPONENT_ARCH_TAG}" \
+                  || { EXIT_CODE=$?; echo "failed to tag loaded image: [loaded: ${LOADED_IMAGE}, tag: ${COMPONENT_ARCH_TAG}]" 1>&2; exit ${EXIT_CODE}; }
+
+                  docker push "${COMPONENT_ARCH_TAG}" \
+                  || { EXIT_CODE=$?; echo "failed to push tagged component image: ${COMPONENT_ARCH_TAG}" 1>&2; exit ${EXIT_CODE}; }
+
+                  PUSHED_IMAGES+=("${COMPONENT_ARCH_TAG}")
+                  COMPONENT_IMAGES+=("--amend" "${COMPONENT_ARCH_TAG}")
+              done
+
+              # Create multi-arch manifest using the version
+              MANIFEST_TAG="${{ inputs.image-registry }}/${COMPONENT}:${VERSION}"
+
+              echo "creating multi-arch manifest for: ${MANIFEST_TAG}"
+
+              docker manifest create "${MANIFEST_TAG}" ${COMPONENT_IMAGES[@]} \
+              || { EXIT_CODE=$?; echo "failed to create multi-arch manifest: ${MANIFEST_TAG}" 1>&2; exit ${EXIT_CODE}; }
+
+              MANIFEST_SHA="$(docker manifest push "${MANIFEST_TAG}")" \
+              || { EXIT_CODE=$?; echo "failed to push multi-arch manifest: ${MANIFEST_TAG}" 1>&2; exit ${EXIT_CODE}; }
+
+              echo "pushed multi-arch manifest: ${MANIFEST_TAG} (digest: ${MANIFEST_SHA})"
+
+              PUSHED_IMAGES+=("${MANIFEST_TAG}")
+          done
+
+          echo "pushed-images=${PUSHED_IMAGES[@]}" >> "${GITHUB_OUTPUT}"
+
+          CHART_TARBALLS=($(echo ${{ github.workspace }}/artifacts/emissary-{crds,ingress}-*.tgz))
+
+          if [[ "${#CHART_TARBALLS[@]}" -eq 0 ]]; then
+              echo "expected exactly 2 chart tarballs, but found none" 1>&2
+              exit 412  # precondition failed
+          elif [[ "${#CHART_TARBALLS[@]}" -eq 1 ]]; then
+              echo "expected exactly 2 chart tarballs, but only found one: ${CHART_TARBALLS}" 1>&2
+              exit 412  # precondition failed
+          elif [[ "${#CHART_TARBALLS[@]}" -gt 2 ]]; then
+              echo -e \
+              "WARNING: expected exactly 2 chart tarballs, but found ${#CHART_TARBALLS[@]}:\n" \
+              "$(IFS=$'\n'; echo "${CHART_TARBALLS[*]}" | sed -E 's#^#\t#')"
+              echo "WARNING: proceeding with chart pushes, but it'd probably be a " \
+              "good idea for an emissary maintainer to double-check the pushed charts"
+          fi
+
+          for CHART in ${CHART_TARBALLS[@]}; do
+              HELM_REGISTRY="oci://${{ inputs.chart-registry }}"
+              echo "pushing chart ${CHART} to ${HELM_REGISTRY}"
+
+              PUSH_RESULT="$(helm push "${CHART}" ${HELM_REGISTRY} 2>&1)" \
+              || { EXIT_CODE=$?; echo "failed to push helm chart tarball ${CHART}:\n- ${PUSH_RESULT}" 1>&2; exit ${EXIT_CODE}; }
+
+              PUSHED_CHART="$(echo "${PUSH_RESULT}" | head -n1 | cut -d' ' -f2)"
+              PUSHED_DIGEST="$(echo "${PUSH_RESULT}" | tail -n1 | cut -d' ' -f2)"
+
+              printf 'pushed chart %s (digest: %s)\n' "${PUSHED_CHART}" "${PUSHED_DIGEST}"
+
+              PUSHED_CHARTS+=("${PUSHED_CHART}")
+          done
+
+          echo "pushed-charts=${PUSHED_CHARTS[@]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Start `upterm` Session
+        if: ${{ env.ACT && inputs.debug && failure() }}
+        uses: ./.github/actions/local-debug
+
+      - id: release-artifacts
+        name: Release
+        if: ${{ !env.ACT }}
+        uses: softprops/action-gh-release@v2
+        with:
+          make_latest: false
+          draft: true
+          fail_on_unmatched_files: true
+          name: Emissary-ingress ${{ inputs.release-tag }}
+          tag_name: ${{ inputs.release-tag }}
+          body: |
+            ## :tada: Emissary ${{ inputs.release-tag }} :tada:
+
+            #### Emissary-ingress is an open source, Kubernetes-native microservices API gateway built on the Envoy Proxy.
+
+            Get started with Emissary-ingress - https://emissary-ingress.dev/docs/${{ inputs.release-tag }}/quick-start/
+            View changelog - https://github.com/emissary-ingress/emissary/blob/${{ inputs.release-tag }}/CHANGELOG.md
+          # files: |
+          #   ${{ github.workspace }}/artifacts/*

@@ -1,0 +1,75 @@
+---
+name: Charts (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ${{ github.ref }}
+        description: Git ref to checkout
+
+    outputs:
+      artifact-id:
+        value: ${{ jobs.build-charts.outputs.artifact-id }}
+        description: GitHub ID of the built chart(s) artifact
+      artifact-url:
+        value: ${{ jobs.build-charts.outputs.artifact-url }}
+        description: >-
+          URL to download the built chart(s) artifact. Can be used in many scenarios
+          such as linking to charts built by a specific CI run in issues or pull requests.
+          Users must be logged-in in order for this URL to work. This URL is valid as
+          long as the chart(s) artifact has not expired or the chart(s) artifact, run
+          or repository have not been deleted.
+      artifact-digest:
+        value: ${{ jobs.build-charts.outputs.artifact-digest }}
+        description: SHA-256 digest of the built chart(s) artifact
+
+permissions:
+  contents: read
+
+jobs:
+  build-charts:
+    name: Build Helm Charts
+    runs-on: ubuntu-latest
+
+    outputs:
+      artifact-id: ${{ steps.upload-chart-artifacts.outputs.artifact-id }}
+      artifact-url: ${{ steps.upload-chart-artifacts.outputs.artifact-url }}
+      artifact-digest: ${{ steps.upload-chart-artifacts.outputs.artifact-digest }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Deps
+        uses: ./.github/actions/setup-deps
+
+      - name: Build Charts
+        shell: bash
+        run: |
+          # When triggered by a tag, use the tag as VERSION instead of recalculating
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            export VERSION="${{ github.ref_name }}"
+            echo "Using tag as VERSION: $VERSION"
+          fi
+          make charts
+
+      - name: Collect Chart Artifacts
+        shell: bash
+        run: |
+          mkdir -p ${{ github.workspace }}/artifacts/charts
+          mv charts/*.tgz ${{ github.workspace }}/artifacts/charts/
+
+      - id: upload-chart-artifacts
+        name: Upload Chart Tarball
+        uses: actions/upload-artifact@v5
+        with:
+          name: charts
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ github.workspace }}/artifacts/charts/*.tgz

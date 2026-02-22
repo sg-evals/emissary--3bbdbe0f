@@ -1,0 +1,29 @@
+{
+  "dependencies": [
+    {
+      "name": "Flask",
+      "version": "2.0.2",
+      "licenses": [
+        "3-clause BSD license"
+      ]
+    },
+    {
+      "name": "Werkzeug",
+      "version": "2.0.2",
+      "licenses": [
+        "3-clause BSD license"
+      ]
+    },
+    {
+      "name": "ptyprocess",
+      "version": "0.7.0",
+      "licenses": [
+        "ISC license"
+      ]
+    }
+  ],
+  "licenseInfo": {
+    "3-clause BSD license": "https://opensource.org/licenses/BSD-3-Clause",
+    "ISC license": "https://opensource.org/licenses/ISC"
+  }
+}

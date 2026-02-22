@@ -1,0 +1,208 @@
+---
+name: Build Docker Images (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ${{ github.ref }}
+        description: Git ref to checkout
+      debug:
+        type: boolean
+        required: false
+        default: false
+        description: |
+          Enable upterm debugging
+
+          NOTE: only available when running locally with netkos/act
+      components:
+        type: string
+        required: false
+        description: |-
+          The list of components to build images for, formatted as a space-separated list of strings.
+
+          Defaults to: apiext emissary kat-client kat-server test-auth test-shadow test-stats
+        default: >-
+          apiext
+          emissary
+          kat-client
+          kat-server
+          test-auth
+          test-shadow
+          test-stats
+      artifact-bundle-prefix:
+        type: string
+        required: true
+        description: Prefix for arch-specific artifact bundle name
+
+    outputs:
+      components:
+        value: ${{ jobs.build-images.outputs.components }}
+        description: >-
+          The list of components images were built for, formatted as a space-separated list of strings.
+      artifact-id:
+        value: ${{ jobs.build-images.outputs.artifact-id }}
+        description: GitHub ID of the built image artifact(s)
+      artifact-url:
+        value: ${{ jobs.build-images.outputs.artifact-url }}
+        description: >-
+          URL to download the built images artifact. Can be used in many scenarios
+          such as linking to images built by a specific CI run in issues or pull requests.
+          Users must be logged-in in order for this URL to work. This URL is valid as
+          long as the images artifact has not expired or the images artifact, run
+          or repository have not been deleted.
+      artifact-digest:
+        value: ${{ jobs.build-images.outputs.artifact-digest }}
+        description: SHA-256 digest of the built images artifact
+      version:
+        # NOTE: This comes from a matrix job, so multiple runners set
+        # this value. The last job to complete wins, but all jobs read
+        # from the same source file (python/ambassador.version), so the
+        # value should be consistent.
+        value: ${{ jobs.build-images.outputs.version }}
+        description: >-
+          The version string used when building the images.
+
+permissions:
+  contents: read
+
+jobs:
+  build-images:
+    name: Build and Save ${{ matrix.arch }} Images
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    outputs:
+      components: ${{ inputs.components }}
+      # NOTE: This comes from a matrix job, so multiple runners set
+      # this value. The last job to complete wins, but all jobs read
+      # from the same source file (python/ambassador.version), so the
+      # value should be consistent.
+      version: ${{ steps.goreleaser-build.outputs.version }}
+      artifact-id: ${{ steps.upload-image-tarballs.outputs.artifact-id }}
+      artifact-url: ${{ steps.upload-image-tarballs.outputs.artifact-url }}
+      artifact-digest: ${{ steps.upload-image-tarballs.outputs.artifact-digest }}
+
+    steps:
+      - id: checkout-repo
+        name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - id: install-deps
+        name: Install Deps
+        uses: ./.github/actions/setup-deps
+        if: ${{ steps.checkout-repo.outcome == 'success' }}
+
+      - id: setup-docker-buildx
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        if: ${{ steps.install-deps.outcome == 'success' }}
+
+      - id: install-goreleaser
+        name: Install GoReleaser
+        if: ${{ steps.setup-docker-buildx.outcome == 'success' }}
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: ~> v2
+          install-only: true
+          distribution: goreleaser
+
+      - id: generate-goreleaser-config
+        name: Generate GoReleaser Config
+        if: ${{ steps.install-goreleaser.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        run: make .goreleaser.yaml
+
+      - id: goreleaser-check
+        name: GoReleaser Check(s)
+        if: ${{ steps.generate-goreleaser-config.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        shell: bash
+        run: |
+          goreleaser check
+          goreleaser healthcheck
+
+      - id: goreleaser-build
+        name: GoReleaser Build
+        if: ${{ steps.goreleaser-check.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        run: |
+          set -euo pipefail
+
+          # Use --snapshot for non-tag builds to avoid "SNAPSHOT" in version tags
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            goreleaser release --clean --skip=publish
+          else
+            goreleaser release --clean --snapshot
+          fi
+
+          # Grab the version from python/ambassador.version -- we'll need to change
+          # this when we get rid of the Python code, but for now it's handy.
+          echo "version=$(head -1 python/ambassador.version)" >> $GITHUB_OUTPUT
+
+      - id: save-image-tarballs
+        name: Export Docker Image Tarballs
+        if: ${{ steps.goreleaser-build.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+          mkdir -p ${{ github.workspace }}/artifacts/images
+
+          VERSION=$(head -1 python/ambassador.version)
+          IMAGES=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+                    | grep ghcr.io/emissary-ingress \
+                    | fgrep "$(echo ${{ inputs.components }} | tr ' ' '\n' | sed -e 's/$/:/')" \
+                    | egrep ":${VERSION}-${{ matrix.arch }}\$")
+
+          echo "Saving images for"
+          echo " - version: ${VERSION}"
+          echo " - architecture: ${{ matrix.arch }}"
+          echo " - components:"
+          echo "${{ inputs.components }}" | sed -e 's/^/    - /'
+          echo ""
+          echo " - images:"
+          echo "${IMAGES}" | sed -e 's/^/    - /'
+
+          for IMAGE in ${IMAGES[@]}; do
+              COMPONENT="$(echo "${IMAGE}" | tr ':' '/' | cut -d'/' -f3)"
+              IMAGE_PATH="${{ github.workspace }}/artifacts/images/${COMPONENT}-${{ matrix.arch }}-image.tar"
+
+              docker save "${IMAGE}" -o "${IMAGE_PATH}" \
+                  || { EXIT_CODE=$?; echo "failed to save image tarball for: ${COMPONENT}" 1>&2; exit ${EXIT_CODE}; }
+
+              echo "saved ${IMAGE} as ${IMAGE_PATH}"
+          done
+
+      - id: upload-image-tarballs
+        name: Upload Docker Image Artifacts
+        if: ${{ steps.save-image-tarballs.outcome == 'success' }}
+        continue-on-error: ${{ inputs.debug }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ inputs.artifact-bundle-prefix }}-${{ matrix.arch }}
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ github.workspace }}/artifacts/images/*.tar
+
+      - name: Start `upterm` Session
+        if: ${{ env.ACT && inputs.debug && failure() }}
+        uses: ./.github/actions/local-debug

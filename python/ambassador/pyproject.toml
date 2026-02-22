@@ -1,0 +1,23 @@
+[project]
+name = "ambassador"
+version = "4.0.0-dev"
+readme = "../README.md"
+dependencies = [
+    "orjson",
+    "pyyaml",
+    "requests",
+    "durationpy",
+    "semantic-version",
+    "prometheus-client",
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[tool.ruff.lint.isort]
+known-local-folder = ["ambassador"]
+
+

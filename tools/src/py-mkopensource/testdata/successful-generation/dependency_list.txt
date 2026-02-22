@@ -1,0 +1,33 @@
+Name: ptyprocess
+Version: 0.7.0
+Summary: Run a subprocess in a pseudo terminal
+Home-page: https://github.com/pexpect/ptyprocess
+Author: Thomas Kluyver
+Author-email: thomas@kluyver.me.uk
+License: UNKNOWN
+Location: /Users/flynn/emissary/k-e/.venv/lib/python3.12/site-packages
+Requires:
+Required-by: pexpect
+
+Name: Flask
+Version: 2.0.2
+Summary: A simple framework for building complex web applications.
+Home-page: https://palletsprojects.com/p/flask
+Author: Armin Ronacher
+Author-email: armin.ronacher@active-4.com
+License: BSD-3-Clause
+Location: /usr/lib/python3.8/site-packages
+Requires: Jinja2, click, itsdangerous, Werkzeug
+Required-by:
+
+Name: Werkzeug
+Version: 2.0.2
+Summary: The comprehensive WSGI web application library.
+Home-page: https://palletsprojects.com/p/werkzeug/
+Author: Armin Ronacher
+Author-email: armin.ronacher@active-4.com
+License: BSD-3-Clause
+Location: /usr/lib/python3.8/site-packages
+Requires:
+Required-by: Flask
+

@@ -1,0 +1,136 @@
+---
+name: CI/CD Pipeline
+
+on:
+  push:
+    tags:
+      - v4.** # Triggers on any tag like v4.0.0, v4.1.2-rc.1, etc.
+    branches:
+      - dev/v4/main
+
+  pull_request:
+    types: # The pull request events to listen for
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - dev/v4/main # The base branch that the pull request is targeting
+
+  workflow_dispatch: # Allows manual triggering of the workflow
+    inputs:
+      ref:
+        type: string
+        default: ""
+        required: false
+        description: Git ref to checkout
+      debug:
+        type: boolean
+        default: false
+        required: false
+        description: |
+          Enable upterm debugging if running locally with netkos/act
+      components:
+        type: string
+        required: false
+        description: |-
+          The list of components to build images for, formatted as a space-separated list of strings.
+
+          Defaults to: apiext emissary kat-client kat-server test-auth test-shadow test-stats
+        default: >-
+          apiext
+          emissary
+          kat-client
+          kat-server
+          test-auth
+          test-shadow
+          test-stats
+      chart-registry:
+        type: string
+        required: false
+        default: ghcr.io/emissary-ingress
+        description: |
+          OCI repository to push charts to
+
+          Defaults to: ghcr.io/emissary-ingress
+      image-registry:
+        type: string
+        required: false
+        default: ghcr.io/emissary-ingress
+        description: |
+          OCI repository to push images to
+
+          Defaults to: ghcr.io/emissary-ingress
+
+permissions:
+  contents: read  # Required by all reusable workflows
+  # packages: write is only granted to release.yaml via its own permissions block
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    uses: ./.github/workflows/lint.yaml
+    with:
+      ref: ${{ github.ref }}
+
+  gotest:
+    name: Go Tests
+    uses: ./.github/workflows/gotest.yaml
+    with:
+      ref: ${{ github.ref }}
+
+  pytest:
+    name: Python Tests
+    uses: ./.github/workflows/pytest.yaml
+    with:
+      ref: ${{ github.ref }}
+
+  build-charts:
+    name: Build Charts
+    uses: ./.github/workflows/build-charts.yaml
+    with:
+      ref: ${{ github.ref }}
+
+  build-images:
+    name: Build Images
+    uses: ./.github/workflows/build-images.yaml
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+      debug: ${{ inputs.debug || false }}
+      components: ${{ inputs.components || 'apiext emissary kat-client kat-server test-auth test-shadow test-stats' }}
+      artifact-bundle-prefix: images-${{ github.sha }}
+
+  test-images:
+    name: Test Images
+    needs:
+      - build-images
+    uses: ./.github/workflows/test-images.yaml
+    with:
+      ref: ${{ github.ref }}
+      artifact-bundle-prefix: images-${{ github.sha }}
+
+  release:
+    name: Release
+    if: ${{ startsWith(github.ref, 'refs/tags/v4.') || (vars.act =='true' && vars.do_release == 'true') }}
+    permissions:
+      contents: write  # Override to allow creating GitHub releases
+      packages: write  # Override to allow pushing to GHCR
+    secrets: inherit
+    uses: ./.github/workflows/release.yaml
+    needs:
+      - lint
+      - gotest
+      - pytest
+      - build-charts
+      - build-images
+      - test-images
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+      debug: ${{ inputs.debug || false }}
+      components: ${{ needs.build-images.outputs.components }}
+      version: ${{ needs.build-images.outputs.version }}
+      chart-registry: ${{ inputs.chart-registry || 'ghcr.io/emissary-ingress' }}
+      image-registry: ${{ inputs.chart-registry || 'ghcr.io/emissary-ingress' }}

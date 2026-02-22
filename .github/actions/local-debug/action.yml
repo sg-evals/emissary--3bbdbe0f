@@ -1,0 +1,170 @@
+---
+name: local-debug
+description: Run `upterm` For Local Debugging
+
+inputs:
+  context:
+    type: string
+    default: ""
+    required: false
+    description: >-
+     The (optional) JSON-serialized state/context of the current runner for debugging purposes
+  propagate-failure:
+    type: boolean
+    default: true
+    required: false
+    description: >-
+      Propagate failure from a previous step or job after the `upterm` session is closed
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+runs:
+  using: composite
+  steps:
+    - id: error-on-non-local-runners
+      name: Error On Non-Local Runners
+      continue-on-error: false
+      if: ${{ !env.ACT || env.ACT == 'false' }}
+      shell: bash
+      run: |
+        echo "This action is only intended to be used when developing or debugging workflows locally via nektos/act" 1>&2
+        exit 405
+
+    # Export the full context of the current runner state for debugging purposes
+    - id: export-context
+      name: Export Current Context
+      continue-on-error: true
+      if: ${{ inputs.context || false }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+        WORKFLOW_DIR="/var/run/${{ env.ACT && 'act' || 'github' }}/workflow"
+
+        mkdir -p "${WORKFLOW_DIR}"
+
+        CTX_PATH="${WORKFLOW_DIR}/gha-context.yaml"
+
+        printf -- '---\n${{ inputs.context || '{ }' }}\n' > "${CTX_PATH}"
+
+        if command -v sponge > /dev/null 2>&1; then
+            cat "${CTX_PATH}" | yq -Po yaml '.' | sponge "${CTX_PATH}"
+        fi
+
+        echo "context-path=${CTX_PATH}" >> "${GITHUB_OUTPUT}"
+
+    - id: error-on-unsupported-local-platforms
+      name: Error On Unsupported Local Platforms (nektos/act)
+      continue-on-error: false
+      if: ${{ env.ACT && (runner.os == 'Windows' || (runner.arch == 'X64' && runner.arch == 'ARM64')) }}
+      shell: bash
+      env:
+        ARCH: ${{ runner.arch == 'X64' && 'AMD64' || runner.arch }}
+      run: |
+        set -euo pipefail
+
+        trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+        if command -v upterm > /dev/null 2>&1; then
+            exit 0
+        fi
+
+        if ${{ runner.os == 'Windows' }}; then
+            echo -e "\nUpterm does not (currently) publish Windows binaries, \
+            see the netkos/act user guide for information on using custom \
+            runner images: https://nektosact.com/\n" 1>&2
+        else
+            ARCH="$(echo "${ARCH}" | tr '[:upper:]' '[:lower:]')"
+            echo -e "\nUpterm does not (currently) publish binaries ${ARCH} binaries, \
+            please see the upterm repository for information on building your own binaries, \
+            and the netkos/act user guide for information on using custom runner images\n\t\
+            upterm repository: https://github.com/owenthereal/upterm\n\t\
+            netkos/act user guide: https://nektosact.com/\n" 1>&2
+        fi
+
+        exit 412
+
+    - id: install-upterm-unofficial
+      name: Install Upterm (nektos/act)
+      continue-on-error: false
+      if: ${{ env.ACT && runner.os != 'Windows' && (runner.arch == 'X64' || runner.arch == 'ARM64') }}
+      shell: bash
+      env:
+        OS: ${{ runner.os == 'macOS' && 'Darwin' || runner.os }}
+        ARCH: ${{ runner.arch == 'X64' && 'AMD64' || runner.arch }}
+        JQ_QUERY: |
+          .assets | map(select(.name | test("^upterm_\(env.PLATFORM)[.]tar[.]gz$"; "i")) | .browser_download_url) | first
+      run: |
+        set -euo pipefail
+
+        trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+        # generate an dedicated SSH key for upterm if one doesn't exist
+        if [[ ! -f ~/.ssh/id_upterm_ed25519 ]]; then
+            COMMENT="$(echo '${{ github.actor }}@${{ github.repository }}.github.action' | tr '/' '.')"
+            ssh-keygen -t ed25519 -f ~/.ssh/id_upterm_ed25519 -C "${COMMENT}" -q -N ""
+        fi
+
+        # install upterm if needed
+        if ! command -v upterm > /dev/null 2>&1; then
+            export PLATFORM="$(echo "${OS}_${ARCH}" | tr '[:upper:]' '[:lower:]')"
+
+            mkdir -p ~/.local/bin
+            echo ~/.local/bin >> "${GITHUB_PATH}"
+
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/owenthereal/upterm/releases/latest \
+            | jq -er "${JQ_QUERY}" \
+            | xargs curl -fsSLo - \
+            | tar -C ~/.local/bin -xzf - upterm
+        fi
+
+        # add the upterm server to the known hosts file if necessary
+        if ! grep '@cert-authority uptermd.upterm.dev ssh-ed25519' ~/.ssh/known_hosts > /dev/null 2>&1; then
+            # note: doing this with the until loop and a timeout is a workaround for
+            # the fact that the upterm server doesn't seem to respond with host keys
+            # for *every* `ssh-keyscan` (i.e. it's apparently flaky)
+            timeout 300s bash -c '
+              until HOST_KEY=$(ssh-keyscan -t ed25519 uptermd.upterm.dev 2>/dev/null) && [[ -n "${HOST_KEY}" ]]; do
+                echo "attempting to acquire uptermd host key ..." >> /dev/stderr
+                sleep 1
+              done
+              echo "@cert-authority ${HOST_KEY}" >> ~/.ssh/known_hosts
+            '
+        fi
+
+    - id: start-unofficial-upterm-session
+      name: Start Upterm Session (netkos/act)
+      continue-on-error: false
+      if: ${{ env.ACT && runner.os == 'Linux' && (runner.arch == 'X64' || runner.arch == 'ARM64') }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+        BANNER='\n\n####################################\n'
+        BANNER+='# GitHub Actions Debugging Session #\n'
+        BANNER+='####################################\n\n'
+
+        if [[ -n "${{ steps.export-context.outputs.context-path }}" ]]; then
+            BANNER+='Current job context can be inspected in: ${{ steps.export-context.outputs.context-path }}\n\n'
+        fi
+
+        printf "${BANNER}"
+
+        upterm host --accept --private-key ~/.ssh/id_upterm_ed25519 -- bash
+
+        while pgrep upterm > /dev/null; do
+            sleep 2
+        done
+
+        if [[ '${{ inputs.propagate-failure }}' == 'true' ]]; then
+            exit 500
+        fi
+

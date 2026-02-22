@@ -1,0 +1,94 @@
+---
+name: setup-deps
+description: Install Go and Python
+
+inputs:
+  install-golang:
+    description: |
+      Install Go
+    required: false
+    default: "true"
+  install-python:
+    description: |
+      Install Python
+    required: false
+    default: "true"
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+runs:
+  using: composite
+  steps:
+    # note: the "standard" ubuntu image built by nektos/act
+    #       doesn't include the `gh`, `ip`, `helm`, `time`,
+    #       `kubectl`, or `rsync` binaries, whereas the official
+    #       GitHub runner instances do by default
+    - name: Install Missing Utils (nektos/act)
+      shell: bash
+      if: ${{ env.ACT }}
+      env:
+        OS: ${{ runner.os }}  # possible values: ["Linux", "Windows", "macOS"]
+        ARCH: ${{ runner.arch == 'X64' && 'x86_64' || runner.arch }}  # possible values: ["X86", "X64", "ARM", "ARM64"]
+      run: |
+        set -euo pipefail
+
+        # remove the (currently) broken Microsoft repo
+        rm -f /etc/apt/sources.list.d/microsoft-prod.list
+
+        # add signing keys for the Helm and Kubernetes repos
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
+        curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor -o /etc/apt/keyrings/helm.gpg
+
+        # add the Helm and Kubernetes repos
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+        echo 'deb [signed-by=/etc/apt/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main' > /etc/apt/sources.list.d/helm.list
+
+        # set permissions apt won't complain about
+        chmod 644 /etc/apt/keyrings/*.gpg /etc/apt/sources.list.d/*.list
+
+        # install the missing tools
+        apt update -y && apt install -yq helm time rsync expect kubectl iproute2 net-tools
+
+        # install the latest GitHub CLI binary
+        if ! command -v gh > /dev/null 2>&1; then
+          curl -fsSL -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/cli/cli/releases/latest \
+          | jq -r '.assets | map(select(.label | test("^GitHub CLI ([0-9.]+)+ \(env.OS) \(env.ARCH)$"; "i")).browser_download_url) | first' \
+          | xargs curl -fsSL \
+          | tar  --strip-components=1 -C /usr -xzf -
+
+          if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            echo '${{ github.token }}' | gh auth login --with-token
+          fi
+        fi
+
+    - name: Install 'bsdtar' & 'helm-push'
+      id: step-install-bsdtar
+      shell: bash
+      run: |
+        sudo apt update -y
+        sudo apt install -yq libarchive-tools
+        if ! helm push --help > /dev/null 2>&1; then
+          helm plugin install https://github.com/chartmuseum/helm-push
+        fi
+
+    - name: Install Go
+      if: ${{ inputs.install-golang == 'true' }}
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Install 'uv' & Python Requirements
+      shell: bash
+      if: ${{ inputs.install-python == 'true' }}
+      env:
+        UV_UNMANAGED_INSTALL: /usr/bin
+      run: |
+        set -euo pipefail
+
+        # install uv
+        curl -fsSL https://astral.sh/uv/install.sh | sudo -E bash
+
+        # install Python requirements
+        uv sync --dev

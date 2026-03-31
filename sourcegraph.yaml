@@ -1,0 +1,6 @@
+# Auto-indexing configuration for Sourcegraph SCIP.
+# Presence of this file on the scip-enabled branch signals that
+# precise code intelligence should be enabled for this repository.
+# Inference is used to determine which indexers to run.
+index_jobs: []
+
